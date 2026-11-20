@@ -5,11 +5,22 @@ import secrets
 import re
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import (
+    APIRouter,
+    Header,
+    HTTPException,
+    status,
+    Depends,
+)
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.ai.llm import generate_response
 from app.retrieval.retriever import retrieve_context
+from app.database.dependencies import get_db
+from app.database.models import Customer
+from app.tools.order_lookup import get_order_status
 
 load_dotenv()
 
@@ -50,6 +61,34 @@ def is_greeting(question: str) -> bool:
     return text in greetings
 
 
+# =========================
+# Tool Definition
+# =========================
+
+ORDER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_order_status",
+            "description": (
+                "Get the status of an order belonging "
+                "to the current customer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "integer",
+                        "description": "The order ID."
+                    }
+                },
+                "required": ["order_id"]
+            }
+        }
+    }
+]
+
+
 @router.post(
     "/ask",
     response_model=AskResponse,
@@ -61,6 +100,7 @@ async def ask_ai(
         ...,
         alias="x-internal-api-key",
     ),
+    db: Session = Depends(get_db),
 ):
 
     expected_key = os.getenv("INTERNAL_API_KEY", "")
@@ -90,7 +130,7 @@ async def ask_ai(
 
     try:
 
-        # Greeting: no RAG, no tools, no customer lookup.
+        # Greeting: no RAG or tools.
         if is_greeting(question):
             return AskResponse(
                 answer=(
@@ -107,36 +147,62 @@ async def ask_ai(
 
         context = retrieval_result.get("context", "")
 
-        if not context or not context.strip():
-            return AskResponse(
-                answer=(
-                    "I'm sorry, I couldn't find this information "
-                    "in our knowledge base. Please contact our "
-                    "support team for assistance."
-                )
+        # Identify the authenticated customer.
+        customer = db.execute(
+            select(Customer).where(
+                Customer.telegram_id == request.telegram_id
+            )
+        ).scalar_one_or_none()
+
+        # Tool handler uses the customer ID from the database.
+        def order_status_handler(order_id: int):
+
+            if not isinstance(order_id, int) or isinstance(order_id, bool):
+                raise ValueError("Invalid order ID.")
+
+            if order_id <= 0:
+                raise ValueError("Invalid order ID.")
+
+            if customer is None:
+                return {
+                    "success": False,
+                    "message": "Customer account not found."
+                }
+
+            return get_order_status(
+                db=db,
+                order_id=order_id,
+                customer_id=customer.id,
             )
 
-        # Answer using retrieved knowledge only.
+        tool_handlers = {
+            "get_order_status": order_status_handler
+        }
+
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are a customer support assistant. "
-                    "Answer using ONLY the knowledge base context. "
+                    "Answer using the knowledge base context. "
                     "Do not invent information. "
                     "If the context does not contain the answer, "
                     "say that you do not have that information. "
-                    "Answer the exact question asked. "
-                    "Do not confuse shipping time with refund time. "
-                    "Do not mention customer accounts or tracking "
-                    "unless the question explicitly asks about them. "
+                    "If the customer explicitly asks about an "
+                    "order status or tracking, use the "
+                    "get_order_status tool. "
+                    "Never invent order information. "
+                    "Use the tool result as the source of truth. "
+                    "If the order is not found, explain that "
+                    "you could not find the order. "
                     "Keep answers clear and concise."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Knowledge base context:\n{context}\n\n"
+                    f"Knowledge base context:\n"
+                    f"{context or 'No relevant context found.'}\n\n"
                     f"Customer question:\n{question}"
                 ),
             },
@@ -144,6 +210,8 @@ async def ask_ai(
 
         answer = await generate_response(
             messages=messages,
+            tools=ORDER_TOOLS,
+            tool_handlers=tool_handlers,
         )
 
         if not answer or not answer.strip():
