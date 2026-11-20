@@ -1,6 +1,8 @@
 
 import re
 
+from app.knowledge_base.ccp.cpp_preprocessor import preprocess_text
+
 
 def split_text(
     text: str,
@@ -22,7 +24,8 @@ def split_text(
             "chunk_overlap must be smaller than chunk_size"
         )
 
-    text = re.sub(r"\s+", " ", text).strip()
+    # C++ text preprocessing
+    text = preprocess_text(text)
 
     if not text:
         return []
